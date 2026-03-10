@@ -1,0 +1,487 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ChatBot para Documentos utilizando Arquitetura RAG</title>
+
+  <!-- Favicon (usa eep-favicon.png se existir; senão eep.png) -->
+  <link rel="icon" href="/static/eep-favicon.png" type="image/png" />
+  <link rel="alternate icon" href="/static/eep.png" type="image/png" />
+  <link rel="apple-touch-icon" href="/static/eep.png" />
+
+  <!-- Fonts -->
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+
+  <!-- HTMX -->
+  <script src="https://unpkg.com/htmx.org@2.0.3"></script>
+  <script src="https://unpkg.com/htmx.org/dist/ext/json-enc.js"></script>
+
+  <!-- Markdown + Highlight -->
+  <script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+
+  <!-- Style (cache-bust) -->
+  <link rel="stylesheet" href="/static/styles.css?v=12" />
+</head>
+<body>
+  <div class="app">
+    <!-- ======= SIDEBAR ======= -->
+    <aside id="sidebar" class="sidebar">
+      <div class="brand">
+        <img src="/static/eep.png" alt="EEP" class="brand-img" onerror="this.style.display='none'"/>
+        <div>
+          <h1 class="title">ChatBot para Documentos utilizando RAG</h1>
+          <p class="subtitle">Pergunte sobre seus documentos.</p>
+        </div>
+      </div>
+
+      <div class="side-actions">
+        <button class="btn primary" id="newChat">+ Novo chat</button>
+        <button class="btn" id="clearAll">Limpar tudo</button>
+      </div>
+
+      <div class="search">
+        🔎 <input id="searchConv" type="text" placeholder="Filtrar histórico..." />
+      </div>
+
+      <div id="historyList" class="history"></div>
+    </aside>
+
+    <!-- ======= MAIN ======= -->
+    <main class="main">
+      <div class="header">
+        <div class="left">
+          <button class="btn ghost" id="toggleSidebar" title="Alternar sidebar">☰</button>
+          <h2 id="convTitle">Nova conversa</h2>
+        </div>
+        <div class="right">
+          <button class="btn" id="exportChat" title="Exportar conversa">Exportar</button>
+          <button class="btn danger" id="deleteChat" title="Excluir conversa atual">Apagar</button>
+          <button class="btn ghost" id="toggleTheme" title="Alternar tema">🌙/☀️</button>
+          <span class="muted" id="tokenInfo">k=<b>4</b></span>
+        </div>
+      </div>
+
+      <!-- Barra de busca dentro da conversa -->
+      <div id="inChatSearch" class="inchat-search" hidden>
+        <input id="inChatInput" type="text" placeholder="Buscar nesta conversa..." />
+        <div class="inchat-actions">
+          <button id="inChatPrev" class="btn">↑</button>
+          <button id="inChatNext" class="btn">↓</button>
+          <button id="inChatClose" class="btn danger">Esc</button>
+        </div>
+      </div>
+
+      <div id="chat" class="chat">
+        <div class="container">
+          <!-- TELA INICIAL COM LOGO EEP -->
+          <div id="emptyState" class="empty">
+            <div class="hero">
+              <img
+                src="/static/eep.png"
+                alt="EEP - Escola de Engenharia de Piracicaba"
+                class="hero-logo"
+                onerror="this.style.display='none'"
+              />
+              <h1>O que quer fazer hoje?</h1>
+              <p>Pergunte qualquer coisa sobre seus documentos.</p>
+            </div>
+          </div>
+
+          <div id="messages"></div>
+        </div>
+      </div>
+
+      <!-- Composer / Form -->
+      <div class="composer">
+        <div class="inner">
+          <form id="chat-form"
+                hx-post="/chat"
+                hx-ext="json-enc"
+                hx-trigger="submit"
+                hx-target="#_noop"
+                hx-swap="none">
+            <div class="row pill">
+              <textarea name="message" id="message" placeholder="Pergunte qualquer coisa..." required></textarea>
+              <input class="k-field" type="number" name="k" id="k" value="4" min="1" max="10" title="Documentos a recuperar (k)" />
+              <button class="send" type="submit" id="sendBtn">Enviar</button>
+            </div>
+          </form>
+          <div id="_noop" hidden></div>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <script>
+    /* ======================= THEME ======================= */
+    const THEME_KEY='rag_theme_v1';
+    const savedTheme=localStorage.getItem(THEME_KEY)||'light';
+    if(savedTheme==='dark'){ document.body.classList.add('dark'); }
+    document.getElementById('toggleTheme').onclick=()=>{
+      document.body.classList.toggle('dark');
+      localStorage.setItem(THEME_KEY, document.body.classList.contains('dark')?'dark':'light');
+    };
+
+    /* ======================= STATE ======================= */
+    const LS = 'rag_convos_v1';
+    // convo: {id, name, createdAt, k, msgs:[{role:'user'|'assistant', text, raw?, sources?}]}
+    let convos = JSON.parse(localStorage.getItem(LS) || '[]');
+    let activeId = localStorage.getItem('rag_active_id') || null;
+
+    (function migrate(){
+      const old = localStorage.getItem('rag_history_v1');
+      if(old && !convos.length){
+        const msgs = JSON.parse(old);
+        const id = uid();
+        convos = [{id, name:'Histórico importado', createdAt:Date.now(), k:4, msgs}];
+        activeId = id; persist();
+        localStorage.removeItem('rag_history_v1');
+      }
+    })();
+
+    if(!activeId){ createNew(); } else { renderAll(); }
+
+    function persist(){
+      localStorage.setItem(LS, JSON.stringify(convos));
+      localStorage.setItem('rag_active_id', activeId || '');
+    }
+    function uid(){ return (Date.now().toString(36)+Math.random().toString(36).slice(2,8)); }
+    function active(){ return convos.find(c=>c.id===activeId); }
+
+    /* ======================= RENDER ======================= */
+    function renderAll(){
+      renderSidebar();
+      renderChat();
+    }
+
+    // Agrupa por faixa de tempo
+    function groupLabel(ts){
+      const d=new Date(ts); const now=new Date();
+      const dayms=24*3600*1000;
+      const startToday=new Date(now.getFullYear(),now.getMonth(),now.getDate()).getTime();
+      const startYesterday=startToday-dayms;
+      const startWeek=startToday-(now.getDay()||7-1)*dayms;
+      const t=d.getTime();
+      if(t>=startToday) return 'Hoje';
+      if(t>=startYesterday) return 'Ontem';
+      if(t>=startWeek) return 'Esta semana';
+      return 'Mais antigos';
+    }
+
+    function renderSidebar(filter=''){
+      const list = document.getElementById('historyList');
+      list.innerHTML = '';
+      const items = convos
+        .slice()
+        .sort((a,b)=>b.createdAt - a.createdAt)
+        .filter(c => (c.name||'').toLowerCase().includes(filter.toLowerCase()));
+
+      let lastGroup='';
+      items.forEach(c=>{
+        const g=groupLabel(c.createdAt);
+        if(g!==lastGroup){
+          lastGroup=g;
+          const h=document.createElement('div');
+          h.className='hist-group'; h.textContent=g;
+          list.appendChild(h);
+        }
+
+        const el = document.createElement('div');
+        el.className = 'conv'+(c.id===activeId?' active':'');
+        el.addEventListener('click', ()=>{ activeId=c.id; persist(); renderAll(); });
+
+        const left = document.createElement('div');
+        left.style.display='flex'; left.style.flexDirection='column';
+
+        const nm = document.createElement('div'); nm.className='name';
+        nm.textContent = c.name || 'Sem título';
+
+        const mt = document.createElement('div'); mt.className='meta';
+        mt.textContent = new Date(c.createdAt).toLocaleString();
+
+        left.appendChild(nm); left.appendChild(mt);
+        el.appendChild(left);
+
+        const trash = document.createElement('span');
+        trash.className='trash'; trash.textContent='🗑️'; trash.title='Excluir conversa';
+        trash.addEventListener('click',(e)=>{ e.stopPropagation(); removeConvo(c.id); });
+        el.appendChild(trash);
+
+        list.appendChild(el);
+      });
+    }
+
+    function renderChat(){
+      const c = active();
+      if(!c){ document.getElementById('messages').innerHTML=''; return; }
+      document.getElementById('convTitle').textContent = c.name || 'Nova conversa';
+      document.getElementById('k').value = c.k || 4;
+      document.getElementById('tokenInfo').innerHTML = 'k=<b>'+ (c.k||4) +'</b>';
+
+      const wrap = document.getElementById('messages');
+      wrap.innerHTML = '';
+
+      const es = document.getElementById('emptyState');
+      if (c.msgs.length) {
+        if (!es.classList.contains('hide') && es.style.display !== 'none') {
+          es.classList.add('hide');
+          setTimeout(()=>{ es.style.display='none'; }, 250);
+        } else {
+          es.style.display='none';
+        }
+      } else {
+        es.classList.remove('hide');
+        es.style.display='grid';
+      }
+
+      c.msgs.forEach(m => wrap.appendChild(renderMsg(m)));
+      scrollToBottom();
+      setTimeout(()=>hljs.highlightAll(),0);
+    }
+
+    // Markdown renderer
+    marked.setOptions({
+      breaks:true,
+      highlight:(code, lang)=>{ try{ return hljs.highlight(code, {language: lang}).value }catch{ return hljs.highlightAuto(code).value } }
+    });
+
+    function renderMsg(m){
+      const msg = document.createElement('div');
+      msg.className = 'msg '+m.role;
+
+      const avatar = document.createElement('div');
+      avatar.className = 'avatar';
+      avatar.textContent = (m.role==='user'?'U':'R');
+      msg.appendChild(avatar);
+
+      const bubble = document.createElement('div');
+      bubble.className = 'bubble';
+
+      if(m.role==='assistant'){
+        const md = m.raw ?? stripHtml(m.text ?? '');
+        const html = marked.parse(md);
+        bubble.innerHTML = html;
+
+        // barra de ferramentas
+        const tools = document.createElement('div');
+        tools.className='tools';
+        const copy = document.createElement('button');
+        copy.className='tool'; copy.type='button'; copy.textContent='Copiar resposta';
+        copy.onclick = ()=>navigator.clipboard.writeText(bubble.innerText);
+        tools.appendChild(copy);
+        bubble.appendChild(tools);
+
+        // citações numeradas [1], [2] + chips (com link se for URL)
+        if(m.sources?.length){
+          const chipsAnchor=document.createElement('div');
+          const citeBar=document.createElement('div'); citeBar.className='citations';
+          m.sources.forEach((s,i)=>{
+            const a=document.createElement('a');
+            a.href='#'; a.className='cite-badge'; a.textContent='['+(i+1)+']';
+            a.title=`${s.source} (score ${Number(s.score).toFixed(3)})`;
+            a.onclick=(e)=>{ e.preventDefault(); chips.scrollIntoView({behavior:'smooth', block:'nearest'}); };
+            citeBar.appendChild(a);
+          });
+          bubble.appendChild(citeBar);
+
+          const chips = document.createElement('div'); chips.className='chips';
+          m.sources.forEach((s,i)=>{
+            const chip = document.createElement('div'); chip.className='chip';
+            const isUrl = /^https?:\/\//i.test(s.source || '');
+            chip.innerHTML = isUrl
+              ? `${i+1}. <a href="${s.source}" target="_blank" rel="noopener">${s.source}</a> — score ${Number(s.score).toFixed(3)}`
+              : `${i+1}. ${s.source} — score ${Number(s.score).toFixed(3)}`;
+            chips.appendChild(chip);
+          });
+          bubble.appendChild(chips);
+          bubble.appendChild(chipsAnchor);
+        }
+      } else {
+        bubble.textContent = m.text;
+      }
+
+      msg.appendChild(bubble);
+      return msg;
+    }
+
+    function scrollToBottom(){
+      const chat = document.getElementById('chat');
+      chat.scrollTop = chat.scrollHeight;
+    }
+
+    /* ================== ACTIONS =================== */
+    function createNew(){
+      const id = uid();
+      convos.push({id, name:'Nova conversa', createdAt:Date.now(), k:4, msgs:[]});
+      activeId=id; persist(); renderAll();
+    }
+    function removeConvo(id){
+      const idx = convos.findIndex(c=>c.id===id);
+      if(idx>-1){
+        convos.splice(idx,1);
+        if(activeId===id){ activeId = convos[0]?.id || null; }
+        persist(); renderAll();
+      }
+    }
+
+    // header actions
+    document.getElementById('newChat').onclick = ()=> createNew();
+    document.getElementById('clearAll').onclick = ()=>{
+      if(confirm('Apagar todo o histórico?')){ convos=[]; activeId=null; persist(); createNew(); }
+    };
+    document.getElementById('deleteChat').onclick = ()=>{
+      const cur = active(); if(!cur) return;
+      if(confirm('Excluir a conversa atual?')) removeConvo(cur.id);
+    };
+    document.getElementById('exportChat').onclick = ()=>{
+      const cur = active(); if(!cur) return;
+      // JSON
+      const json = new Blob([JSON.stringify(cur, null, 2)], {type:'application/json'});
+      const jurl = URL.createObjectURL(json);
+      const j = document.createElement('a');
+      j.href = jurl; j.download = (cur.name||'conversa')+'.json'; j.click(); URL.revokeObjectURL(jurl);
+      // TXT
+      const lines = cur.msgs.map(m => `${m.role.toUpperCase()}: ${m.raw ?? m.text}`).join('\n\n');
+      const txt = new Blob([lines], {type:'text/plain;charset=utf-8'});
+      const turl = URL.createObjectURL(txt);
+      const t = document.createElement('a');
+      t.href = turl; t.download = (cur.name||'conversa')+'.txt'; t.click(); URL.revokeObjectURL(turl);
+    };
+
+    document.getElementById('searchConv').addEventListener('input', (e)=> renderSidebar(e.target.value));
+
+    // K change persists per conversation
+    document.getElementById('k').addEventListener('change', (e)=>{
+      const c = active(); c.k = Number(e.target.value||4); persist();
+      document.getElementById('tokenInfo').innerHTML = 'k=<b>'+c.k+'</b>';
+    });
+
+    // Toggle sidebar (desktop)
+    document.getElementById('toggleSidebar').addEventListener('click', ()=>{
+      document.body.classList.toggle('sidebar-collapsed');
+    });
+
+    /* =================== FORM & HTMX =================== */
+    document.getElementById('chat-form').addEventListener('submit', (e)=>{
+      const textEl = document.getElementById('message');
+      const text = textEl.value.trim();
+      if(!text) return;
+
+      const c = active();
+      if(c.msgs.length===0){ c.name = text.slice(0, 42) + (text.length>42 ? '…' : ''); }
+
+      c.msgs.push({role:'user', text});
+      persist(); renderChat();
+
+      addTyping();
+      document.getElementById('sendBtn').disabled = true;
+    });
+
+    document.body.addEventListener('htmx:afterOnLoad', function(evt){
+      document.getElementById('sendBtn').disabled = false;
+      removeTyping();
+
+      try{
+        const data = JSON.parse(evt.detail.xhr.responseText);
+        const sources = (data.contexts||[]).map(c=>({source:c.source, score:c.score}));
+        const raw = String(data.answer||'');
+        active().msgs.push({role:'assistant', raw, sources});
+        persist(); renderChat();
+      }catch(err){
+        active().msgs.push({role:'assistant', raw:'*Erro ao interpretar a resposta.*'});
+        persist(); renderChat();
+      }
+
+      const textarea = document.getElementById('message');
+      textarea.value = ''; textarea.focus();
+    });
+
+    document.body.addEventListener('htmx:responseError', function(){
+      document.getElementById('sendBtn').disabled = false;
+      removeTyping();
+      active().msgs.push({role:'assistant', raw:'*Falha ao processar. Tente novamente.*'});
+      persist(); renderChat();
+    });
+
+
+    // Enter para enviar / Shift+Enter para nova linha
+    document.getElementById('message').addEventListener('keydown', (e)=>{
+      if(e.key === 'Enter'){
+        if(!e.shiftKey){ // apenas Enter
+          e.preventDefault(); // impede nova linha
+          document.getElementById('chat-form').requestSubmit();
+        }
+        // Shift+Enter continua quebrando linha
+      }
+    });
+
+
+    // garantir que k enviado corresponde ao da conversa
+    document.getElementById('chat-form').addEventListener('submit', ()=>{
+      document.getElementById('k').value = active().k || 4;
+    });
+
+    /* ============== typing animation ============== */
+    function addTyping(){
+      const wrap = document.getElementById('messages');
+      const msg = document.createElement('div'); msg.className='msg assistant'; msg.id='typing';
+      msg.innerHTML = `
+        <div class="avatar">R</div>
+        <div class="bubble"><div class="typing">
+          <span class="dot"></span><span class="dot"></span><span class="dot"></span>
+        </div></div>`;
+      wrap.appendChild(msg); scrollToBottom();
+    }
+    function removeTyping(){ const t = document.getElementById('typing'); if(t) t.remove(); }
+
+    /* ============== In-chat search (Ctrl+F) ============== */
+    const searchBox=document.getElementById('inChatSearch');
+    const searchInput=document.getElementById('inChatInput');
+    let matches=[], matchIdx=-1;
+
+    function clearHighlights(){
+      document.querySelectorAll('.hl').forEach(el=>{
+        el.outerHTML = el.innerText;
+      });
+    }
+    function highlightQuery(q){
+      clearHighlights(); matches=[]; matchIdx=-1;
+      if(!q) return;
+      const nodes=[...document.querySelectorAll('#messages .bubble')];
+      const re=new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'),'gi');
+      nodes.forEach(b=>{
+        b.innerHTML = b.innerHTML.replace(re, m=>`<mark class="hl">${m}</mark>`);
+      });
+      matches=[...document.querySelectorAll('mark.hl')];
+      if(matches.length){ matchIdx=0; focusMatch(); }
+    }
+    function focusMatch(){
+      matches.forEach(m=>m.classList.remove('current'));
+      const cur=matches[matchIdx]; if(!cur) return;
+      cur.classList.add('current');
+      cur.scrollIntoView({behavior:'smooth', block:'center'});
+    }
+
+    document.addEventListener('keydown',(e)=>{
+      if((e.ctrlKey||e.metaKey) && e.key==='f'){
+        e.preventDefault();
+        searchBox.hidden=false; searchInput.focus(); searchInput.select();
+      }
+      if(!searchBox.hidden){
+        if(e.key==='Escape'){ searchBox.hidden=true; clearHighlights(); }
+      }
+    });
+    document.getElementById('inChatClose').onclick=()=>{ searchBox.hidden=true; clearHighlights(); };
+    document.getElementById('inChatPrev').onclick=()=>{ if(matches.length){ matchIdx=(matchIdx-1+matches.length)%matches.length; focusMatch(); } };
+    document.getElementById('inChatNext').onclick=()=>{ if(matches.length){ matchIdx=(matchIdx+1)%matches.length; focusMatch(); } };
+    searchInput.addEventListener('input', (e)=> highlightQuery(e.target.value));
+
+    /* ============== helpers ============== */
+    function stripHtml(html){ const div=document.createElement('div'); div.innerHTML=html; return div.textContent||div.innerText||''; }
+  </script>
+</body>
+</html>
